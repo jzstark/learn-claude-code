@@ -1,7 +1,8 @@
+import json
 import os
-import re
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -15,82 +16,37 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-SKILLS_DIR = WORKDIR / "skills"
+
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Keep working step by step, and use compact if the conversation gets too long."
+)
+
+CONTEXT_LIMIT = 50000
+KEEP_RECENT_TOOL_RESULTS = 3
+PERSIST_THRESHOLD = 30000
+PREVIEW_CHARS = 2000
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
 
 @dataclass
-class SkillManifest:
-    name: str
-    description: str
-    path: Path
+class CompactState:
+    has_compacted: bool = False
+    last_summary: str = ""
+    recent_files: list[str] = field(default_factory=list)
 
 
-@dataclass
-class SkillDocument:
-    manifest: SkillManifest
-    body: str
+def estimate_context_size(messages: list) -> int:
+    return len(str(messages))
 
 
-class SkillRegistry:
-    def __init__(self, skills_dir: Path):
-        self.skills_dir = skills_dir
-        self.documents: dict[str, SkillDocument] = {}
-        self._load_all()
-
-    def _load_all(self) -> None:
-        if not self.skills_dir.exists():
-            return
-
-        for path in sorted(self.skills_dir.rglob("SKILL.md")):
-            meta, body = self._parse_frontmatter(path.read_text())
-            name = meta.get("name", path.parent.name)
-            description = meta.get("description", "No description")
-            manifest = SkillManifest(name=name, description=description, path=path)
-            self.documents[name] = SkillDocument(manifest=manifest, body=body.strip())
-
-    def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
-        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-        if not match:
-            return {}, text
-
-        meta = {}
-        for line in match.group(1).strip().splitlines():
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            meta[key.strip()] = value.strip()
-        return meta, match.group(2)
-
-    def describe_available(self) -> str:
-        if not self.documents:
-            return "(no skills available)"
-        lines = []
-        for name in sorted(self.documents):
-            manifest = self.documents[name].manifest
-            lines.append(f"- {manifest.name}: {manifest.description}")
-        return "\n".join(lines)
-
-    def load_full_text(self, name: str) -> str:
-        document = self.documents.get(name)
-        if not document:
-            known = ", ".join(sorted(self.documents)) or "(none)"
-            return f"Error: Unknown skill '{name}'. Available skills: {known}"
-
-        return (
-            f"<skill name=\"{document.manifest.name}\">\n"
-            f"{document.body}\n"
-            "</skill>"
-        )
-
-
-SKILL_REGISTRY = SkillRegistry(SKILLS_DIR)
-
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use load_skill when a task needs specialized instructions before you act.
-
-Skills available:
-{SKILL_REGISTRY.describe_available()}
-"""
+def track_recent_file(state: CompactState, path: str) -> None:
+    if path in state.recent_files:
+        state.recent_files.remove(path)
+    state.recent_files.append(path)
+    if len(state.recent_files) > 5:
+        state.recent_files[:] = state.recent_files[-5:]
 
 
 def safe_path(path_str: str) -> Path:
@@ -100,7 +56,105 @@ def safe_path(path_str: str) -> Path:
     return path
 
 
-def run_bash(command: str) -> str:
+def persist_large_output(tool_use_id: str, output: str) -> str:
+    if len(output) <= PERSIST_THRESHOLD:
+        return output
+
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    stored_path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    if not stored_path.exists():
+        stored_path.write_text(output)
+
+    preview = output[:PREVIEW_CHARS]
+    rel_path = stored_path.relative_to(WORKDIR)
+    return (
+        "<persisted-output>\n"
+        f"Full output saved to: {rel_path}\n"
+        "Preview:\n"
+        f"{preview}\n"
+        "</persisted-output>"
+    )
+
+
+def collect_tool_result_blocks(messages: list) -> list[tuple[int, int, dict]]:
+    blocks = []
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                blocks.append((message_index, block_index, block))
+    return blocks
+
+
+def micro_compact(messages: list) -> list:
+    tool_results = collect_tool_result_blocks(messages)
+    if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
+        return messages
+
+    for _, _, block in tool_results[:-KEEP_RECENT_TOOL_RESULTS]:
+        content = block.get("content", "")
+        if not isinstance(content, str) or len(content) <= 120:
+            continue
+        block["content"] = "[Earlier tool result compacted. Re-run the tool if you need full detail.]"
+    return messages
+
+
+def write_transcript(messages: list) -> Path:
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with path.open("w") as handle:
+        for message in messages:
+            handle.write(json.dumps(message, default=str) + "\n")
+    return path
+
+
+def summarize_history(messages: list) -> str:
+    conversation = json.dumps(messages, default=str)[:80000]
+    prompt = (
+        "Summarize this coding-agent conversation so work can continue.\n"
+        "Preserve:\n"
+        "1. The current goal\n"
+        "2. Important findings and decisions\n"
+        "3. Files read or changed\n"
+        "4. Remaining work\n"
+        "5. User constraints and preferences\n"
+        "Be compact but concrete.\n\n"
+        f"{conversation}"
+    )
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+    )
+    return response.content[0].text.strip()
+
+
+def compact_history(messages: list, state: CompactState, focus: str | None = None) -> list:
+    transcript_path = write_transcript(messages)
+    print(f"[transcript saved: {transcript_path}]")
+
+    summary = summarize_history(messages)
+    if focus:
+        summary += f"\n\nFocus to preserve next: {focus}"
+    if state.recent_files:
+        recent_lines = "\n".join(f"- {path}" for path in state.recent_files)
+        summary += f"\n\nRecent files to reopen if needed:\n{recent_lines}"
+
+    state.has_compacted = True
+    state.last_summary = summary
+
+    return [{
+        "role": "user",
+        "content": (
+            "This conversation was compacted so the agent can continue working.\n\n"
+            f"{summary}"
+        ),
+    }]
+
+
+def run_bash(command: str, tool_use_id: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
         return "Error: Dangerous command blocked"
@@ -116,16 +170,18 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-    output = (result.stdout + result.stderr).strip()
-    return output[:50000] if output else "(no output)"
+    output = (result.stdout + result.stderr).strip() or "(no output)"
+    return persist_large_output(tool_use_id, output)
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, tool_use_id: str, state: CompactState, limit: int | None = None) -> str:
     try:
+        track_recent_file(state, path)
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)[:50000]
+        output = "\n".join(lines)
+        return persist_large_output(tool_use_id, output)
     except Exception as exc:
         return f"Error: {exc}"
 
@@ -151,14 +207,6 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as exc:
         return f"Error: {exc}"
 
-
-TOOL_HANDLERS = {
-    "bash": lambda **kw: run_bash(kw["command"]),
-    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
-}
 
 TOOLS = [
     {
@@ -208,12 +256,13 @@ TOOLS = [
         },
     },
     {
-        "name": "load_skill",
-        "description": "Load the full body of a named skill into the current context.",
+        "name": "compact",
+        "description": "Summarize earlier conversation so work can continue in a smaller context.",
         "input_schema": {
             "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
+            "properties": {
+                "focus": {"type": "string"},
+            },
         },
     },
 ]
@@ -230,8 +279,28 @@ def extract_text(content) -> str:
     return "\n".join(texts).strip()
 
 
-def agent_loop(messages: list) -> None:
+def execute_tool(block, state: CompactState) -> str:
+    if block.name == "bash":
+        return run_bash(block.input["command"], block.id)
+    if block.name == "read_file":
+        return run_read(block.input["path"], block.id, state, block.input.get("limit"))
+    if block.name == "write_file":
+        return run_write(block.input["path"], block.input["content"])
+    if block.name == "edit_file":
+        return run_edit(block.input["path"], block.input["old_text"], block.input["new_text"])
+    if block.name == "compact":
+        return "Compacting conversation..."
+    return f"Unknown tool: {block.name}"
+
+
+def agent_loop(messages: list, state: CompactState) -> None:
     while True:
+        messages[:] = micro_compact(messages)
+
+        if estimate_context_size(messages) > CONTEXT_LIMIT:
+            print("[auto compact]")
+            messages[:] = compact_history(messages, state)
+
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -245,15 +314,16 @@ def agent_loop(messages: list) -> None:
             return
 
         results = []
+        manual_compact = False
+        compact_focus = None
         for block in response.content:
             if block.type != "tool_use":
                 continue
 
-            handler = TOOL_HANDLERS.get(block.name)
-            try:
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-            except Exception as exc:
-                output = f"Error: {exc}"
+            output = execute_tool(block, state)
+            if block.name == "compact":
+                manual_compact = True
+                compact_focus = (block.input or {}).get("focus")
 
             print(f"> {block.name}: {str(output)[:200]}")
             results.append({
@@ -264,19 +334,25 @@ def agent_loop(messages: list) -> None:
 
         messages.append({"role": "user", "content": results})
 
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = compact_history(messages, state, focus=compact_focus)
+
 
 if __name__ == "__main__":
     history = []
+    compact_state = CompactState()
+
     while True:
         try:
-            query = input("\033[36ms05 >> \033[0m")
+            query = input("\033[36ms06 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
 
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        agent_loop(history, compact_state)
 
         final_text = extract_text(history[-1]["content"])
         if final_text:
